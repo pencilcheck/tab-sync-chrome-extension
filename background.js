@@ -183,13 +183,14 @@ function merge(fromState, toState, isToStateFresh) {
       }
     }
 
+    // TODO: handle conflict, remote change a tab, but local delete that tab, vice versa
+
     mergedState.push(state)
   })
 
   return mergedState
 }
 
-// Show popup if there are conflicts
 function diff(fromState, toState) {
   var changes = []
 
@@ -354,18 +355,10 @@ if (options.autoSync) {
   var pullIntervalId = setInterval(function () {
     if (options.sync) {
       pull().done(function (state) {
-        console.log('pull from', currentServer)
-        console.log(state)
         chrome.windows.getAll({populate: true}, function (windows) {
           var changes = diff(format(windows), state.snapshot || [])
           if (changes.length > 0) {
             dirty = true
-            console.log('windows')
-            console.log(windows)
-            console.log('merged result')
-            console.log(merge(format(windows), state.snapshot || []))
-            console.log('diff with windows')
-            console.log(diff(format(windows), merge(format(windows), state.snapshot || [])))
             apply(diff(format(windows), merge(format(windows), state.snapshot || [])))
           }
         })
