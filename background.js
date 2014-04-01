@@ -1,4 +1,7 @@
 /*
+ * RELAXATION: assume every url is unique in a window, 
+ * and each tab permutation in a window is unique in a session
+ *
  * TODO:
  * Able to toggle syncing with browser action
  * Able to have session management
@@ -7,415 +10,446 @@
  * Able to manage windows/tabs in sessions
  */
 
-var servers = [
-      'http://localhost:5000',
-    ],
-    options = {
-      platform: 'chrome',
-      threshold: 0.9,
+var options = {
+      servers: [
+        'http://localhost:5000',
+      ],
+      getPrev: true,
+      dryRun: true,
       autoSync: true,
       sync: true,
-      dryRun: true,
-      interval: 3000
+      refresh: 3000,
     },
-    deletedTabs = {},
-    tabLastChange = {},
-    dirty = false,
-    currentServer = servers[0]
-
-function LCS(sequenceL, sequenceR) {
-  var memoization = {}
-
-  memoization[',,'] = []
-  sequenceL.forEach(function (x, i) {
-    memoization[i.toString() + ','] = []
-  })
-
-  sequenceR.forEach(function (y, j) {
-    memoization[',' + j.toString()] = []
-  })
-
-  var LCSBase = function (l, r) {
-    var index = (l.length == 0 ? ',' : (l.length-1).toString()) + (r.length == 0 ? ',' : (r.length-1).toString())
-    if (memoization[index]) {
-      return memoization[index]
+    global = {
+      lastPendingTask: 'none',
+      logs: [],
+      revision: null,
+      prevWindows: [],
+      currentServer: options.servers[0],
     }
-
-    if (l[l.length-1] != r[r.length-1]) {
-      var one = LCSBase(l.slice(0, l.length-1), r)
-          two = LCSBase(l, r.slice(0, r.length-1))
-
-      if (one.length > two.length)
-        memoization[index] = one
-      else
-        memoization[index] = two
-
-      return memoization[index]
-    } else {
-      var result = LCSBase(l.slice(0, l.length-1), r.slice(0, r.length-1))
-      memoization[index] = result.concat(l[l.length-1])
-      return memoization[index]
-    }
-  }
-
-  return LCSBase(sequenceL, sequenceR)
-}
-
 
 function pickAServer() {
-  var x = Math.floor(Math.random() * servers.length-1)
-  return servers[x]
+  var x = Math.floor(Math.random() * global.servers.length-1)
+  return global.servers[x]
 }
 
-function pull() {
-  return $.get(currentServer)
+function pull(revision) {
+  return $.get(global.currentServer, {revision: revision}, null, 'json')
     .fail(function (xhr, st) {
       console.log('fail', xhr.statusText)
       if (st == 'timeout') {
-        currentServer = pickAServer()
+        global.currentServer = pickAServer()
         return pull()
       }
     })
 }
 
-function push(current, name) {
+function push() {
   var self = this,
       data = arguments
 
-  return $.post(currentServer, {command: 'push', data: data})
+  return $.post(global.currentServer, {command: 'push', data: data})
     .fail(function (xhr, st) {
       console.log('fail', xhr.statusText)
       if (st == 'timeout') {
-        currentServer = pickAServer()
+        global.currentServer = pickAServer()
         return push.apply(self, arguments) // Infinite retry
       }
+    }).done(function (data) {
+      // Clear logs
+      console.log('pushed all local changes to server', global.logs)
+      global.logs = []
+      // Update revision
+      getLatestRemoteState().then(function (state) {
+        console.log('update revision to', state.revision)
+        global.revision = state.revision
+      })
     })
 }
 
-function similarity(winL, winR) {
-  var denominator = Math.max(winL.tabs.length, winR.tabs.length)
-  var numerator = LCS(winL.tabs.map(function (tab) {
-    return tab.url
-  }), winR.tabs.map(function (tab) {
-    return tab.url
-  })).length
-
-  return numerator / denominator
-}
-
-function mapping(local, remote) {
-  var localToRemote = {}
-
-  // Three kinds of changes: add, remove, change
-  local.forEach(function (windowL, indexL) {
-    remote.forEach(function (windowR, indexR) {
-      if (similarity(windowL, windowR) >= options.threshold)
-        localToRemote[indexL] = indexR
-    })
-  })
-
-  return localToRemote
-}
-
-function merge(fromState, toState, isToStateFresh) {
-  var mergedState = []
-
-  var fromStateTotoState = mapping(fromState, toState)
-
-  if (Object.keys(fromStateTotoState).length < fromState.length) {
-    fromState.forEach(function (win, index) {
-      if (Object.keys(fromStateTotoState).indexOf(index) < 0) {
-        mergedState.push(win)
-      }
-    })
-  }
-
-  if (_.values(fromStateTotoState).length < toState.length) {
-    toState.forEach(function (win, index) {
-      if (_.values(fromStateTotoState).indexOf(index) < 0) {
-        mergedState.push(win)
-      }
-    })
-  }
-
-  Object.keys(fromStateTotoState).forEach(function (index) {
-    var state = fromState[index]
-    // FIXME: Ask user or by default just merge everything with duplicates
-    // Need different merge strategy
-
-    // This takse the newest tabs for tabs that both present and changed
-    for (var i = 0; i < state.tabs.length; i++) {
-      var tab = state.tabs[i],
-          neighbors = [state.tabs[i-1], state.tabs[i+1]]
-
-      for (var j = 0; j < toState[index].tabs.length; j++) {
-        var jab = toState[index].tabs[j],
-            jeighbors = [toState[index].tabs[j-1], toState[index].tabs[j+1]]
-
-        if (neighbors == jeighbors && tab.lastChanged.getTime() < jab.lastChanged.getTime()) {
-          state.tabs[i] = jab
-        }
-      }
-    }
-
-    // Add tabs that are not in current window session
-    for (var i = 0; i < toState[index].tabs.length; i++) {
-      var tab = toState[index].tabs[i],
-          neighbors = [toState[index].tabs[i-1], toState[index].tabs[i+1]]
-
-      var has = false
-      for (var j = 0; j < state.tabs.length; j++) {
-        var jab = state.tabs[j],
-            jeighbors = [state.tabs[j-1], state.tabs[j+1]]
-
-        if (neighbors == jeighbors && tab.url == jab.url) {
-          has = true
-        }
-      }
-
-      // Not a tab deleted locally
-      if (!has && !deletedTabs[tab.id]) {
-        if (i < state.tabs.length) {
-          state.tabs.splice(i, 1, tab)
-        } else {
-          state.tabs.push(tab)
-        }
-      }
-    }
-
-    // TODO: handle conflict, remote change a tab, but local delete that tab, vice versa
-
-    mergedState.push(state)
-  })
-
-  return mergedState
-}
-
-function diff(fromState, toState) {
-  var changes = []
-
-  var fromStateTotoState = mapping(fromState, toState)
-  if (Object.keys(fromStateTotoState).length < fromState.length) {
-    // Close windows
-    fromState.forEach(function (win, index) {
-      if (Object.keys(fromStateTotoState).indexOf(index) < 0) {
-        changes.push({
-          action: 'remove',
-          type: 'window',
-          windowId: win[options.platform].windowId
-        })
-      }
-    })
-  }
-
-  if (_.values(fromStateTotoState).length < toState.length) {
-    // New windows
-    toState.forEach(function (win, index) {
-      if (_.values(fromStateTotoState).indexOf(index) < 0) {
-        changes.push({
-          action: 'create',
-          type: 'window',
-          info: {
-            tabs: win.tabs.map(function (tab) {
-              return tab.url
-            })
-          }
-        })
-      }
-    })
-  }
-  
-  for (var fromStateIndex in fromStateTotoState) {
-    if (fromStateTotoState.hasOwnProperty(fromStateIndex)) {
-      var fromStateTabs = fromState[fromStateIndex].tabs,
-          toStateTabs = toState[fromStateTotoState[fromStateIndex]].tabs,
-          commonTabUrls = LCS(fromStateTabs.map(function (tab) {
-            return tab.url
-          }), toStateTabs.map(function (tab) {
-            return tab.url
-          }))
-
-      var indexC = 0,
-          indexS = 0,
-          indexD = 0
-
-      while (indexC < commonTabUrls.length) {
-        var commonTabUrl = commonTabUrls[indexC],
-            fromStateTab = fromStateTabs[indexS]
-        if (commonTabUrl == fromStateTab.url) {
-          indexC += 1
-          indexS += 1
-        } else if (commonTabUrl != fromStateTab.url) {
-          indexC += 1
-          changes.push({
-            action: 'remove',
-            type: 'tab',
-            tabId: fromStateTab[options.platform].tabId
-          })
-        }
-      }
-
-      indexC = 0
-      while (indexC < commonTabUrls.length) {
-        var commonTabUrl = commonTabUrls[indexC],
-            toStateTab = toStateTabs[indexD]
-        if (commonTabUrl == toStateTab.url) {
-          indexC += 1
-          indexD += 1
-        } else if (commonTabUrl != toStateTab.url) {
-          indexC += 1
-          changes.push({
-            action: 'create',
-            type: 'tab',
-            info: {
-              url: toStateTab,
-              windowId: fromStateIndex,
-              index: indexC
-            }
-          })
-        }
-      }
-    }
-  }
-
-  return changes
-}
-
-function apply(changes) {
-  if (!options.dryRun) {
-    // Apply to client
-    changes.forEach(function (change) {
-      switch (change.action) {
-      case 'create':
-        if (change.type == 'tab') {
-          chrome.tabs.create(change.info)
-        } else {
-          chrome.windows.create(change.info)
-        }
-        break
-      case 'update':
-        if (change.type == 'tab') {
-          chrome.tabs.update(change.tabId, change.info)
-        } else {
-          chrome.windows.update(change.windowId, change.info)
-        }
-        break
-      case 'remove':
-        if (change.type == 'tab') {
-          chrome.tabs.remove(change.tabId)
-        } else {
-          chrome.windows.remove(change.windowId)
-        }
-        break
-      }
-    })
-  } else {
-    console.log('apply changes')
-    console.log(changes)
-  }
-}
-
-// Format windows returned to valid format accepted by SM
-function format(windows) {
-  return windows.filter(function (win) {
-    return win.type == 'normal'
-  }).map(function (win, ind) {
-    var tabs = win.tabs.map(function (tab) {
+function reverseLogs(logs) {
+  return logs.slice().reverse().map(function (log) {
+    switch (log.action) {
+    case 'created':
       return {
-        chrome: {
-          tabId: tab.id
-        },
-        lastChanged: tabLastChange[tab.id],
-        url: tab.url
+        action: 'removed',
+        type: log.type,
+        info: log.info
       }
-    })
-    return {
-      chrome: {
-        windowId: win.id
-      },
-      tabs: tabs
+      break
+    case 'updated':
+      var revLog = $.extend({}, log),
+          tempUrl = revLog.info.url
+      revLog.info.url = revLog.info.prevUrl
+      revLog.info.prevUrl = tempUrl
+      return revLog
+      break
+    case 'moved':
+      var revLog = $.extend({}, log),
+          tempIndex = revLog.info.index
+
+      // Change urls to after it has been moved
+      var url = revLog.info.urls[revLog.info.fromIndex]
+      revLog.info.urls.splice(revLog.info.index, 1, url)
+      revLog.info.urls.splice(revLog.info.fromIndex, 1)
+
+      // Reverse indexes
+      revLog.info.index = revLog.info.fromIndex
+      revLog.info.fromIndex = tempUrl
+      return revLog
+      break
+    case 'removed':
+      return {
+        action: 'created',
+        type: log.type,
+        info: {
+          index: log.info.index,
+          url: log.info.url,
+          urls: log.info.urls.slice().filter(function (url, ind) { return ind == log.info.index })
+        }
+      }
+      break
     }
   })
 }
 
-if (options.autoSync) {
-  var pushIntervalId = setInterval(function () {
-    if (options.sync) {
-      chrome.windows.getAll({populate: true}, function (windows) {
-        if (dirty) {
-          console.log('push')
-          push(format(windows), null).then(function () {
-            dirty = false
+function getLatestRemoteState() {
+  console.log('getLatestRemoteState')
+  return pull().then(function (states) {
+    return states[0]
+  })
+}
+
+// Reset state to revision
+function resetTo(revision) {
+  var revLogs = reverseLogs(global.logs)
+  return apply(revLogs)
+}
+
+// Apply whatever in logs to current state
+function applyLogs() {
+  return apply([{logs: global.logs}]) // apply should gather a list of conflicts to be resolved by the user
+}
+
+function rebase() {
+  global.lastPendingTask = 'rebase'
+  return resetTo(global.revision)
+    .then(fastForward)
+    .then(applyAll) // conflicts should be resolved automatically (let user decide later)
+    .then(pushAll)
+    .then(function () {
+      global.lastPendingTask = 'none'
+    })
+}
+
+function apply(states) {
+  var headAction = Q(true)
+  // Apply to client
+  states.forEach(function (state) {
+    state.logs.forEach(function (log) {
+      switch (log.action) {
+      case 'created':
+        if (log.type == 'tab') {
+          headAction.then(function () {
+            var defer = Q.defer()
+            getWindows().then(function (windows) {
+              windows.forEach(function (w) {
+                // log.info.urls: list of urls of the window before the tab was added
+                if (log.info.urls == w.tabs.map(function (t) { return t.url })) {
+                  log.info.windowId = w.id
+                  if (options.dryRun) {
+                    console.log('tab create', log.info)
+                  } else {
+                    chrome.tabs.create(log.info, defer.resolve)
+                  }
+                }
+              })
+            })
+            return defer.promise
+          })
+        } else {
+          headAction.then(function () {
+            var defer = Q.defer()
+            if (options.dryRun) {
+              console.log('window create', log.info)
+            } else {
+              chrome.windows.create(log.info, defer.resolve)
+            }
+            return defer.promise
           })
         }
-      })
-    }
-  }, options.interval)
+        break
+      case 'moved':
+        if (log.type == 'tab') {
+          headAction.then(function () {
+            var defer = Q.defer()
+            getWindows().then(function (windows) {
+              windows.forEach(function (w) {
+                // log.info.urls: list of urls of the window before the tab was changed
+                if (log.info.urls == w.tabs.map(function (t) { return t.url })) {
+                  var tab = w.tabs[log.info.fromIndex]
+                  if (options.dryRun) {
+                    console.log('tab move', tab.id, log.info)
+                  } else {
+                    chrome.tabs.move(tab.id, log.info, defer.resolve)
+                  }
+                }
+              })
+            })
+            return defer.promise
+          })
+        }
+        break
+      case 'updated':
+        if (log.type == 'tab') {
+          headAction.then(function () {
+            var defer = Q.defer()
+            getWindows().then(function (windows) {
+              windows.forEach(function (w) {
+                // log.info.urls: list of urls of the window before the tab was changed
+                if (log.info.urls == w.tabs.map(function (t) { return t.url })) {
+                  var tab = w.tabs[log.info.index]
+                  if (options.dryRun) {
+                    console.log('tab update', tab.id, log.info)
+                  } else {
+                    chrome.tabs.update(tab.id, log.info, defer.resolve)
+                  }
+                }
+              })
+            })
+            return defer.promise
+          })
+        }
+        break
+      case 'removed':
+        if (log.type == 'tab') {
+          headAction.then(function () {
+            var defer = Q.defer()
+            getWindows().then(function (windows) {
+              windows.forEach(function (w) {
+                // log.info.urls: list of urls of the window before the tab was changed
+                if (log.info.urls == w.tabs.map(function (t) { return t.url })) {
+                  var tab = w.tabs[log.info.index]
+                  if (options.dryRun) {
+                    console.log('tab remove', tab.id)
+                  } else {
+                    chrome.tabs.remove(tab.id, defer.resolve)
+                  }
+                }
+              })
+            })
+            return defer.promise
+          })
+        } else {
+          headAction.then(function () {
+            var defer = Q.defer()
+            getWindows().then(function (windows) {
+              windows.forEach(function (w) {
+                // log.info.urls: list of urls of the window before the tab was changed
+                if (log.info.urls == w.tabs.map(function (t) { return t.url })) {
+                  if (options.dryRun) {
+                    console.log('window remove', w.id)
+                  } else {
+                    chrome.windows.remove(w.id, defer.resolve)
+                  }
+                }
+              })
+            })
+            return defer.promise
+          })
+        }
+        break
+      }
+    })
+  })
+  return headAction
+}
 
-  var pullIntervalId = setInterval(function () {
-    if (options.sync) {
-      pull().done(function (state) {
-        chrome.windows.getAll({populate: true}, function (windows) {
-          var changes = diff(format(windows), state.snapshot || [])
-          if (changes.length > 0) {
-            dirty = true
-            apply(diff(format(windows), merge(format(windows), state.snapshot || [])))
-          }
-        })
-      })
-    }
-  }, options.interval)
+function pushAll() {
+  console.log('pushAll')
+  return getWindows().then(function (windows) {
+    return push({logs: global.logs, snapshot: windows})
+  })
+}
+
+function fastForward() {
+  return pull(global.revision+1).then(function (states) {
+    apply(states).then(function () {
+      global.revision = states.slice(-1)[0].revision
+      console.log('fast forwarded to', global.revision)
+    })
+  })
+}
+
+function getWindow(windowId) {
+  var defer = Q.defer()
+  chrome.windows.get(windowId, {populate: true}, defer.resolve)
+  return defer.promise
+}
+
+// Only normal windows
+function getWindows() {
+  function filter(windows) {
+    return windows.filter(function (win) {
+      return win.type == 'normal' && !win.incognito
+    })
+  }
+
+  var defer = Q.defer()
+  chrome.windows.getAll({populate: true}, function (windows) {
+    defer.resolve(filter(windows))
+  })
+  return defer.promise
+}
+
+function getPrevWindow(windowId, cb) {
+  getPrevWindows(function (windows) {
+    windows.forEach(function (w) {
+      if (w.id == windowId) {
+        cb(w)
+      }
+    })
+  })
+}
+
+function getPrevWindows(callback) {
+  options.getPrev = false
+  callback(global.prevWindows)
+  options.getPrev = true
+}
+
+function toUrls(tabs) {
+  return tabs.map(function (t) { return t.url })
 }
 
 
-chrome.windows.onCreated.addListener(function (window) {
-  // Track changes locally to localStorage that persist through browser restarts
-  // then apply them once user turn sync back on
-  console.log('windows.onCreated', window)
-  if (window.type == 'normal' && !window.incognito) {
-  }
-})
-
-chrome.windows.onRemoved.addListener(function (windowId) {
+// Callbacks
+function windowsOnRemoved(windowId) {
   console.log('windows.onRemoved', windowId)
-})
+  getPrevWindow(windowId, function (w) {
+    global.logs.push({
+      action: 'removed',
+      type: 'window',
+      info: {
+        urls: w.tabs.map(function (tab) { return tab.url })
+      }
+    })
+  })
+}
 
-chrome.tabs.onCreated.addListener(function (tab) {
+function windowsOnCreated(w) {
+  console.log('windows.onCreated', w)
+  global.logs.push({
+    action: 'created',
+    type: 'window',
+    info: {
+      incognito: w.incognito,
+      type: w.type
+    }
+  })
+}
+
+function onCreated(tab) {
   console.log('tabs.onCreated', tab, tab.id)
-  delete deletedTabs[tab.id]
-})
+  getPrevWindow(tab.windowId, function (w) {
+    // For new window, urls should be an empty list
+    global.logs.push({
+      action: 'created',
+      type: 'tab',
+      info: {
+        index: tab.index,
+        url: tab.url,
+        urls: toUrls(w.tabs)
+      }
+    })
+  })
+}
 
-chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
-  console.log('tabs.onUpdated', tabId, changeInfo, tab)
-  if (changeInfo.status == 'loading') {
-    tabLastChange[tabId] = new Date()
-  }
-})
-
-chrome.tabs.onMoved.addListener(function (tabId, moveInfo) {
-  console.log('tabs.onMoved', tabId, moveInfo)
-  tabLastChange[tabId] = new Date()
-})
-
-chrome.tabs.onDetached.addListener(function (tabId, detachInfo) {
-  console.log('tabs.onDetached', tabId, detachInfo)
-  tabLastChange[tabId] = new Date()
-  deletedTabs[tabId] = new Date()
-})
-
-chrome.tabs.onAttached.addListener(function (tabId, attachInfo) {
+function onAttached(tabId, attachInfo) {
   console.log('tabs.onAttached', tabId, attachInfo)
-  tabLastChange[tabId] = new Date()
-  delete deletedTabs[tabId]
-})
+  chrome.tab.get(tabId, function (tab) {
+    onCreated(tab)
+  })
+}
 
-chrome.tabs.onRemoved.addListener(function (tabId, removeInfo) {
-  console.log('tabs.onRemoved', tabId, removeInfo)
-  tabLastChange[tabId] = new Date()
-  deletedTabs[tabId] = new Date()
-  if (removeInfo.isWindowClosing) {
+function onUpdated(tabId, changeInfo, tab) {
+  console.log('tabs.onUpdated', tabId, changeInfo, tab)
+  // Loading is called first
+  if (changeInfo.status == 'loading') {
+    getPrevWindow(tab.windowId, function (w) {
+      // onUpdated will be called multiple times
+      // Make sure the url is different
+      if (w.tabs[tab.index].url != tab.url) {
+        global.logs.push({
+          action: 'updated',
+          type: 'tab',
+          info: {
+            index: tab.index,
+            url: changeInfo.url,
+            urls: toUrls(w.tabs),
+            prevUrl: w.tabs[tab.index].url
+          }
+        })
+      }
+    })
   }
-})
+}
+
+function onMoved(tabId, moveInfo) {
+  console.log('tabs.onMoved', tabId, moveInfo)
+  getPrevWindow(moveInfo.windowId, function (w) {
+    global.logs.push({
+      action: 'moved',
+      type: 'tab',
+      info: {
+        index: moveInfo.toIndex,
+        fromIndex: moveInfo.fromIndex,
+        urls: toUrls(w.tabs)
+      }
+    })
+  })
+}
+
+function onRemoved(tabId, removeInfo) {
+  console.log('tabs.onRemoved', tabId, removeInfo)
+  getPrevWindow(removeInfo.windowId, function (w) {
+    // removeInfo.isWindowClosing is not reliable
+    w.tabs.forEach(function (tab) {
+      if (tab.id == tabId) {
+        global.logs.push({
+          action: 'removed',
+          type: 'tab',
+          info: {
+            index: tab.index,
+            urls: toUrls(w.tabs),
+            url: tab.url, // For reverse
+          }
+        })
+      }
+    })
+  })
+}
+
+function onDetached(tabId, detachInfo) {
+  console.log('tabs.onDetached', tabId, detachInfo)
+  onRemoved(tabId, detachInfo)
+}
+
+chrome.windows.onCreated.addListener(windowsOnCreated)
+
+chrome.windows.onRemoved.addListener(windowsOnRemoved)
+
+chrome.tabs.onCreated.addListener(onCreated)
+
+chrome.tabs.onAttached.addListener(onAttached)
+
+chrome.tabs.onUpdated.addListener(onUpdated)
+
+chrome.tabs.onMoved.addListener(onMoved)
+
+chrome.tabs.onRemoved.addListener(onRemoved)
+
+chrome.tabs.onDetached.addListener(onDetached)
 
 chrome.browserAction.onClicked.addListener(function (tab) {
   if (options.sync) {
@@ -426,3 +460,34 @@ chrome.browserAction.onClicked.addListener(function (tab) {
     options.sync != options.sync
   }
 })
+
+// For getting the previous state before the callback called
+setInterval(function () {
+  if (options.getPrev) {
+    getWindows().then(function (windows) {
+      global.prevWindows = windows
+    })
+  }
+}, 300)
+
+setInterval(function () {
+  console.log('tick')
+  // Only new windows/tabs are auto in sync,
+  // old windows/tabs need users explicitly enable to sync (using page action)
+  if (options.autoSync && options.sync) {
+    getLatestRemoteState().then(function (state) {
+      if (state && state.revision > global.revision) {
+        if (global.logs.length == 0) {
+          return fastForward()
+        } else {
+          return rebase()
+        }
+      } else {
+        // push all local changes as a snapshot to state machine
+        if (global.revision === null || (global.revision % 1 === 0 && global.logs.length > 0)) {
+          return pushAll() 
+        }
+      }
+    })
+  }
+}, options.refresh)

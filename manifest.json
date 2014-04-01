@@ -8,7 +8,7 @@
   },
   "browser_action": {},
   "background": {
-    "scripts": ["underscore-min.js", "jquery-2.1.0.min.js", "background.js"],
+    "scripts": ["es5-shim.js", "es6-shim.js", "q.js", "underscore-min.js", "jquery-2.1.0.min.js", "background.js"],
     "persistent": true
   },
   "permissions": [
