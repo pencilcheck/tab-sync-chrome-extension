@@ -3,6 +3,7 @@
  * and each tab permutation in a window is unique in a session
  *
  * TODO:
+ * Able to remove dup tabs automatically
  * Able to toggle syncing with browser action
  * Able to have session management
  * Able to manage sessions
@@ -471,7 +472,6 @@ setInterval(function () {
 }, 300)
 
 setInterval(function () {
-  console.log('tick')
   // Only new windows/tabs are auto in sync,
   // old windows/tabs need users explicitly enable to sync (using page action)
   if (options.autoSync && options.sync) {
