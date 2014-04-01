@@ -1,0 +1,21 @@
+{
+  "manifest_version": 2,
+  "name": "Tab Sync",
+  "version": "0.0.1",
+
+  "description": "Keeps the same tabs on all your machines. Tab changes are applied in real time on all of your devices.",
+  "icons": {
+  },
+  "browser_action": {},
+  "background": {
+    "scripts": ["underscore-min.js", "jquery-2.1.0.min.js", "background.js"],
+    "persistent": true
+  },
+  "permissions": [
+    "storage",
+    "tabs",
+    "http://localhost/*",
+    "http://*.herokuapp.com/*",
+    "https://*.herokuapp.com/*"
+  ]
+}
